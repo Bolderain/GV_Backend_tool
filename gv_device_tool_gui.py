@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GV Device Correction Tool — GUI
-================================
-PySide6 frontend for gv_device_tool.py.
-Runs the SSH/Postgres/Redis workflow in a background thread so the UI stays
-responsive. Same Corinex blue-light theme as csv_tool_modern.py.
+GV Device Correction Tool — GUI  (Variant B: embedded PowerShell terminal)
+===========================================================================
+Spawns powershell.exe via QProcess. Auto-connects SSH, injects password,
+sends docker commands one by one and shows live output. User can also type
+manually at any time.
 
-Dependencies:  pip install paramiko PySide6
+Dependencies:  pip install PySide6
+               (paramiko NOT required for GUI — only for the CLI)
 .exe:          pyinstaller --onefile --windowed --name gv_device_tool_gui gv_device_tool_gui.py
 """
 
 from __future__ import annotations
 
+import re
 import sys
-import threading
+from enum import Enum, auto
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject
-from PySide6.QtGui import QColor, QFont, QTextCursor
+from PySide6.QtCore import Qt, QProcess, QTimer, Signal
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -31,11 +33,10 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QLabel,
     QLineEdit,
-    QComboBox,
     QPlainTextEdit,
     QCheckBox,
+    QComboBox,
     QFrame,
-    QSizePolicy,
     QMessageBox,
 )
 
@@ -43,24 +44,20 @@ import gv_device_tool as core
 
 
 # ---------------------------------------------------------------------------
-# Colors — same palette as csv_tool_modern.py
+# Colors
 # ---------------------------------------------------------------------------
 ACCENT      = "#0067b8"
 ACCENT_DARK = "#004f8c"
-OK_GREEN    = "#107c10"
-WARN_ORANGE = "#b85c00"
-ERR_RED     = "#c42b1c"
-
-LOG_COLORS = {
-    "INFO":  "#d4d4d4",
-    "OK":    "#4ec94e",
-    "WARN":  "#e8a44a",
-    "ERROR": "#f47474",
-}
+OK_GREEN    = "#4ec94e"
+WARN_ORANGE = "#e8a44a"
+ERR_RED     = "#f47474"
+INFO_COLOR  = "#d4d4d4"
+CMD_COLOR   = "#7aabcc"    # echoed commands
+META_COLOR  = "#888888"    # status / meta messages
 
 
 # ---------------------------------------------------------------------------
-# Stylesheet (identical feel to CSV Tool)
+# Stylesheet
 # ---------------------------------------------------------------------------
 def _stylesheet() -> str:
     return f"""
@@ -84,7 +81,8 @@ def _stylesheet() -> str:
         font-size: 10pt;
         background: transparent;
     }}
-    QLabel#muted {{ color: #5b6068; background: transparent; }}
+    QLabel#muted  {{ color: #5b6068; background: transparent; }}
+    QLabel#warn   {{ color: {WARN_ORANGE}; font-weight: bold; background: transparent; }}
     QGroupBox#card {{
         background: #ffffff;
         border: 1px solid #d6dce3;
@@ -100,7 +98,7 @@ def _stylesheet() -> str:
         padding: 0 4px;
         color: {ACCENT};
     }}
-    QLineEdit, QComboBox, QPlainTextEdit {{
+    QLineEdit, QComboBox {{
         background: #ffffff;
         border: 1px solid #c4cbd3;
         border-radius: 4px;
@@ -108,13 +106,8 @@ def _stylesheet() -> str:
         selection-background-color: {ACCENT};
         selection-color: #ffffff;
     }}
-    QLineEdit:focus, QComboBox:focus {{
-        border: 1px solid {ACCENT};
-    }}
-    QLineEdit:disabled, QComboBox:disabled {{
-        background: #f2f5f9;
-        color: #8a9099;
-    }}
+    QLineEdit:focus, QComboBox:focus {{ border: 1px solid {ACCENT}; }}
+    QLineEdit:disabled, QComboBox:disabled {{ background: #f2f5f9; color: #8a9099; }}
     QComboBox::drop-down {{ border: none; width: 18px; }}
     QPushButton {{
         background: #ffffff;
@@ -123,7 +116,7 @@ def _stylesheet() -> str:
         border-radius: 5px;
         padding: 6px 14px;
     }}
-    QPushButton:hover {{ background: #f1f6fb; border-color: {ACCENT}; }}
+    QPushButton:hover   {{ background: #f1f6fb; border-color: {ACCENT}; }}
     QPushButton:pressed {{ background: #e4eef8; }}
     QPushButton:disabled {{ background: #f2f5f9; color: #a0a8b0; border-color: #d6dce3; }}
     QPushButton#primary {{
@@ -135,7 +128,7 @@ def _stylesheet() -> str:
         font-size: 11pt;
         font-weight: bold;
     }}
-    QPushButton#primary:hover {{ background: {ACCENT_DARK}; }}
+    QPushButton#primary:hover    {{ background: {ACCENT_DARK}; }}
     QPushButton#primary:disabled {{ background: #a0bdd6; color: #e0eaf3; }}
     QPushButton#danger {{
         background: {ERR_RED};
@@ -146,7 +139,8 @@ def _stylesheet() -> str:
         font-size: 11pt;
         font-weight: bold;
     }}
-    QPushButton#danger:hover {{ background: #a32318; }}
+    QPushButton#danger:hover    {{ background: #c43030; }}
+    QPushButton#danger:disabled {{ background: #e8a0a0; color: #fff; }}
     QCheckBox {{ spacing: 6px; }}
     QCheckBox::indicator {{
         width: 16px; height: 16px;
@@ -158,47 +152,220 @@ def _stylesheet() -> str:
         background: {ACCENT};
         border-color: {ACCENT};
     }}
-    QPlainTextEdit#log {{
-        background: #0f0f14;
-        color: #d4d4d4;
-        font-family: "Consolas", "Courier New", monospace;
-        font-size: 9pt;
-        border-radius: 6px;
-        border: none;
-    }}
     """
 
 
 # ---------------------------------------------------------------------------
-# Background worker
+# ANSI / pattern helpers
 # ---------------------------------------------------------------------------
-class WorkerSignals(QObject):
-    log_line  = Signal(str, str)   # (level, message)
-    finished  = Signal(int)        # return code
+_ANSI_RE     = re.compile(r"\x1b\[[0-9;]*[mGKHFJABCDsuhl]")
+_BASH_PROMPT = re.compile(r"[#\$]\s*$")          # remote shell prompt
+_PW_PROMPT   = re.compile(r"password[^:]*:\s*$", re.IGNORECASE)
 
 
-class GvWorker(QThread):
-    def __init__(self, cfg: core.Config):
-        super().__init__()
-        self._cfg = cfg
-        self.signals = WorkerSignals()
-        self._log = _SignalLog(self.signals.log_line)
-
-    def run(self):
-        rc = core.run(self._cfg, self._log)
-        self.signals.finished.emit(rc)
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
-class _SignalLog:
-    """Adapts the core.Log interface to Qt signals (thread-safe)."""
-    def __init__(self, signal):
-        self._sig = signal
+def _html(text: str, color: str) -> str:
+    safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f'<span style="color:{color};font-family:Consolas,monospace;">{safe}</span>'
 
-    def info(self, m):  self._sig.emit("INFO",  m)
-    def warn(self, m):  self._sig.emit("WARN",  m)
-    def error(self, m): self._sig.emit("ERROR", m)
-    def ok(self, m):    self._sig.emit("OK",    m)
-    def close(self):    pass
+
+# ---------------------------------------------------------------------------
+# State machine for the SSH automation
+# ---------------------------------------------------------------------------
+class _State(Enum):
+    IDLE             = auto()
+    WAITING_PASSWORD = auto()   # sent ssh cmd, waiting for password prompt
+    WAITING_PROMPT   = auto()   # password sent (or key auth), waiting for bash $
+    RUNNING          = auto()   # sending commands one by one
+    DONE             = auto()
+
+
+# ---------------------------------------------------------------------------
+# Embedded terminal panel
+# ---------------------------------------------------------------------------
+class TerminalPanel(QWidget):
+    """
+    Hosts a powershell.exe QProcess.
+    Public API:
+        start()                    — (re)start the PS process
+        show_dry_run(cmds)         — print commands without SSH
+        run_ssh(cfg, cmd_list)     — auto-run SSH workflow
+        kill()                     — terminate process
+    """
+
+    all_done = Signal(bool)   # True = success / False = error
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self._proc = QProcess(self)
+        self._proc.setProcessChannelMode(QProcess.MergedChannels)
+        self._proc.readyRead.connect(self._on_data)
+        self._proc.finished.connect(self._on_finished)
+
+        self._state: _State = _State.IDLE
+        self._auto_pw: str | None = None
+        self._cmd_queue: list[str] = []
+        self._cmd_idx = 0
+
+        # --- layout ---
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self._view = QPlainTextEdit()
+        self._view.setReadOnly(True)
+        self._view.setMinimumHeight(240)
+        self._view.setStyleSheet(
+            "background:#0f0f14; color:#d4d4d4;"
+            "font-family:Consolas,'Courier New',monospace; font-size:9pt;"
+            "border-radius:6px; border:none; padding:6px;"
+        )
+        lay.addWidget(self._view)
+
+        in_row = QHBoxLayout()
+        in_row.setContentsMargins(0, 4, 0, 0)
+        in_row.setSpacing(6)
+        lbl = QLabel("PS›")
+        lbl.setStyleSheet(
+            f"color:{CMD_COLOR}; font-family:Consolas; font-size:9pt;"
+            "background:transparent; font-weight:bold;"
+        )
+        self._inp = QLineEdit()
+        self._inp.setPlaceholderText("type command and press Enter…")
+        self._inp.setStyleSheet(
+            "background:#1a1a22; color:#d4d4d4;"
+            "font-family:Consolas,'Courier New',monospace; font-size:9pt;"
+            "border:1px solid #333; border-radius:4px; padding:4px 8px;"
+        )
+        self._inp.returnPressed.connect(self._on_manual_input)
+        in_row.addWidget(lbl)
+        in_row.addWidget(self._inp)
+        lay.addLayout(in_row)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """(Re)start powershell.exe."""
+        if self._proc.state() != QProcess.NotRunning:
+            self._proc.kill()
+            self._proc.waitForFinished(2000)
+        self._state = _State.IDLE
+        self._proc.start("powershell.exe", ["-NoLogo", "-NoExit", "-Command", "-"])
+        self._meta("PowerShell started.")
+
+    def show_dry_run(self, cmds: dict) -> None:
+        """Print the commands without connecting — dry-run mode."""
+        self._meta("DRY-RUN — commands that would run on the server:")
+        self._append_line("")
+        for cmd in cmds.values():
+            self._append_html(_html(cmd, INFO_COLOR))
+            self._append_line("")
+        self._meta("Re-import CSV via GV Web UI afterwards.")
+        self.all_done.emit(True)
+
+    def run_ssh(self, cfg: core.Config, cmd_list: list[str]) -> None:
+        """
+        Auto-run SSH workflow:
+          ssh user@host → [password] → docker commands → exit
+        """
+        self._auto_pw = cfg.ssh_password or None
+        self._cmd_queue = cmd_list
+        self._cmd_idx = 0
+        self._state = _State.WAITING_PASSWORD if self._auto_pw else _State.WAITING_PROMPT
+
+        ssh_cmd = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {cfg.ssh_user}@{cfg.host}"
+        self._echo_cmd(ssh_cmd)
+        self._write(ssh_cmd)
+
+    def kill(self) -> None:
+        if self._proc.state() != QProcess.NotRunning:
+            self._proc.kill()
+        self._state = _State.DONE
+        self._meta("Process killed.")
+
+    def clear(self) -> None:
+        self._view.clear()
+
+    # ------------------------------------------------------------------
+    # Internal — data handler (state machine)
+    # ------------------------------------------------------------------
+
+    def _on_data(self) -> None:
+        raw  = bytes(self._proc.readAll()).decode("utf-8", "replace")
+        text = _strip_ansi(raw).replace("\r\n", "\n").replace("\r", "\n")
+
+        # Always show raw output
+        self._view.moveCursor(QTextCursor.End)
+        self._view.insertPlainText(text)
+        self._view.moveCursor(QTextCursor.End)
+
+        last_line = text.rstrip("\n").rsplit("\n", 1)[-1]
+
+        if self._state == _State.WAITING_PASSWORD:
+            if _PW_PROMPT.search(last_line):
+                self._write(self._auto_pw or "")
+                self._meta("[password sent]")
+                self._state = _State.WAITING_PROMPT
+
+        elif self._state == _State.WAITING_PROMPT:
+            if _BASH_PROMPT.search(last_line):
+                self._state = _State.RUNNING
+                self._send_next()
+
+        elif self._state == _State.RUNNING:
+            if _BASH_PROMPT.search(last_line):
+                self._send_next()
+
+    def _send_next(self) -> None:
+        if self._cmd_idx >= len(self._cmd_queue):
+            self._state = _State.DONE
+            self._write("exit")
+            self._meta("All commands sent. SSH session closed.")
+            self.all_done.emit(True)
+            return
+        cmd = self._cmd_queue[self._cmd_idx]
+        self._cmd_idx += 1
+        self._echo_cmd(cmd)
+        self._write(cmd)
+
+    def _on_finished(self, code: int, _status) -> None:
+        self._meta(f"[process exited: {code}]")
+
+    def _on_manual_input(self) -> None:
+        text = self._inp.text().strip()
+        self._inp.clear()
+        if text:
+            self._echo_cmd(text)
+            self._write(text)
+
+    # ------------------------------------------------------------------
+    # Internal — helpers
+    # ------------------------------------------------------------------
+
+    def _write(self, text: str) -> None:
+        self._proc.write((text + "\r\n").encode("utf-8"))
+
+    def _append_html(self, html: str) -> None:
+        self._view.moveCursor(QTextCursor.End)
+        self._view.appendHtml(html)
+        self._view.moveCursor(QTextCursor.End)
+
+    def _append_line(self, text: str) -> None:
+        self._view.moveCursor(QTextCursor.End)
+        self._view.insertPlainText(text + "\n")
+        self._view.moveCursor(QTextCursor.End)
+
+    def _echo_cmd(self, cmd: str) -> None:
+        self._append_html(_html(f"\n▶ {cmd}", CMD_COLOR))
+
+    def _meta(self, msg: str) -> None:
+        self._append_html(_html(f"\n# {msg}", META_COLOR))
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +375,8 @@ class GvToolWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GV Device Correction Tool")
-        self.resize(820, 760)
-        self.setMinimumSize(700, 640)
-        self._worker: GvWorker | None = None
+        self.resize(860, 820)
+        self.setMinimumSize(720, 680)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -220,20 +386,20 @@ class GvToolWindow(QMainWindow):
 
         root.addWidget(self._build_header())
 
-        scroll_area = QWidget()
-        scroll_layout = QVBoxLayout(scroll_area)
-        scroll_layout.setContentsMargins(18, 16, 18, 16)
-        scroll_layout.setSpacing(12)
+        body = QWidget()
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(18, 16, 18, 16)
+        body_lay.setSpacing(12)
 
-        scroll_layout.addWidget(self._build_csv_card())
-        scroll_layout.addWidget(self._build_connection_card())
-        scroll_layout.addWidget(self._build_db_card())
-        scroll_layout.addWidget(self._build_options_card())
-        scroll_layout.addWidget(self._build_run_card())
-        scroll_layout.addWidget(self._build_log_card())
-        scroll_layout.addStretch(1)
+        body_lay.addWidget(self._build_csv_card())
+        body_lay.addWidget(self._build_connection_card())
+        body_lay.addWidget(self._build_db_card())
+        body_lay.addWidget(self._build_options_card())
+        body_lay.addWidget(self._build_run_card())
+        body_lay.addWidget(self._build_terminal_card())
+        body_lay.addStretch(1)
 
-        root.addWidget(scroll_area)
+        root.addWidget(body)
 
     # ------------------------------------------------------------------
     # UI builders
@@ -245,13 +411,16 @@ class GvToolWindow(QMainWindow):
         lay = QVBoxLayout(bar)
         lay.setContentsMargins(18, 12, 18, 12)
         lay.setSpacing(2)
-        title = QLabel("GV Device Correction Tool")
-        title.setObjectName("headerTitle")
-        sub = QLabel("Remove incorrectly imported devices from GridValue (Postgres + Redis) and re-import via GV Web UI")
-        sub.setObjectName("headerSub")
-        sub.setWordWrap(True)
-        lay.addWidget(title)
-        lay.addWidget(sub)
+        t = QLabel("GV Device Correction Tool")
+        t.setObjectName("headerTitle")
+        s = QLabel(
+            "Remove incorrectly imported devices from GridValue "
+            "(Postgres + Redis) and re-import via GV Web UI"
+        )
+        s.setObjectName("headerSub")
+        s.setWordWrap(True)
+        lay.addWidget(t)
+        lay.addWidget(s)
         return bar
 
     def _card(self, title: str) -> tuple[QGroupBox, QVBoxLayout]:
@@ -262,16 +431,15 @@ class GvToolWindow(QMainWindow):
         return box, lay
 
     def _build_csv_card(self) -> QGroupBox:
-        box, lay = self._card("① Input CSV")
-
+        box, lay = self._card("①  Input CSV")
         hint = QLabel("Select the corrected GV import CSV (columns: serialNumber, macAddress, type, …)")
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         lay.addWidget(hint)
 
         row = QHBoxLayout()
-        _default_csv = str(Path(__file__).parent / "Device_import_20260603_Hassfurt_62_R310.csv")
-        self.csv_edit = QLineEdit(_default_csv if Path(_default_csv).exists() else "")
+        _default = str(Path(__file__).parent / "Device_import_20260603_Hassfurt_62_R310.csv")
+        self.csv_edit = QLineEdit(_default if Path(_default).exists() else "")
         self.csv_edit.setPlaceholderText("Path to CSV file…")
         row.addWidget(self.csv_edit)
         btn = QPushButton("Browse…")
@@ -286,17 +454,15 @@ class GvToolWindow(QMainWindow):
         self.mode_combo.setCurrentText("auto")
         self.mode_combo.setToolTip(
             "auto — no type-column check\n"
-            "repeater / headend / proxy / 1t — warns if type column doesn't match"
+            "repeater / headend / proxy / 1t — warns if type doesn't match"
         )
         mode_row.addWidget(self.mode_combo)
         mode_row.addStretch(1)
         lay.addLayout(mode_row)
-
         return box
 
     def _build_connection_card(self) -> QGroupBox:
-        box, lay = self._card("② SSH Connection")
-
+        box, lay = self._card("②  SSH Connection")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
@@ -319,15 +485,14 @@ class GvToolWindow(QMainWindow):
         grid.addWidget(QLabel("SSH Password:"), 1, 2, Qt.AlignRight)
         self.pw_edit = QLineEdit()
         self.pw_edit.setEchoMode(QLineEdit.Password)
-        self.pw_edit.setPlaceholderText("leave blank to use SSH key / agent")
+        self.pw_edit.setPlaceholderText("leave blank for SSH key / agent")
         grid.addWidget(self.pw_edit, 1, 3)
 
         lay.addLayout(grid)
         return box
 
     def _build_db_card(self) -> QGroupBox:
-        box, lay = self._card("③ Postgres / Redis")
-
+        box, lay = self._card("③  Postgres / Redis")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
@@ -354,9 +519,9 @@ class GvToolWindow(QMainWindow):
         return box
 
     def _build_options_card(self) -> QGroupBox:
-        box, lay = self._card("④ Options")
+        box, lay = self._card("④  Options")
         row = QHBoxLayout()
-        self.dry_run_cb = QCheckBox("Dry-run (show commands only, change nothing)")
+        self.dry_run_cb = QCheckBox("Dry-run (show commands only — no changes)")
         self.dry_run_cb.setChecked(True)
         self.no_redis_cb = QCheckBox("Skip Redis FLUSHALL")
         row.addWidget(self.dry_run_cb)
@@ -367,8 +532,7 @@ class GvToolWindow(QMainWindow):
         return box
 
     def _build_run_card(self) -> QGroupBox:
-        box, lay = self._card("⑤ Run")
-
+        box, lay = self._card("⑤  Run")
         warn = QLabel(
             "⚠  LIVE mode permanently deletes devices from the database. "
             "Always verify with dry-run first."
@@ -381,39 +545,75 @@ class GvToolWindow(QMainWindow):
         self.run_btn = QPushButton("▶  Run")
         self.run_btn.setObjectName("primary")
         self.run_btn.clicked.connect(self._on_run)
-
-        self.cancel_btn = QPushButton("■  Cancel")
+        self.cancel_btn = QPushButton("■  Kill terminal")
         self.cancel_btn.setObjectName("danger")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._on_cancel)
-
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.cancel_btn)
         btn_row.addStretch(1)
         lay.addLayout(btn_row)
 
-        self.status_label = QLabel("")
-        self.status_label.setWordWrap(True)
-        lay.addWidget(self.status_label)
-
+        self.status_lbl = QLabel("")
+        self.status_lbl.setWordWrap(True)
+        lay.addWidget(self.status_lbl)
         return box
 
-    def _build_log_card(self) -> QGroupBox:
-        box, lay = self._card("Log")
+    def _build_terminal_card(self) -> QGroupBox:
+        box, lay = self._card("Terminal")
 
-        self.log_view = QPlainTextEdit()
-        self.log_view.setObjectName("log")
-        self.log_view.setReadOnly(True)
-        self.log_view.setMinimumHeight(200)
-        lay.addWidget(self.log_view)
+        # --- Step buttons (send individual commands) ---
+        step_lbl = QLabel("Send individual step:")
+        step_lbl.setObjectName("muted")
+        lay.addWidget(step_lbl)
+
+        step_row = QHBoxLayout()
+        step_row.setSpacing(6)
+
+        self._step_btns: list[QPushButton] = []
+
+        steps = [
+            ("① SELECT",  "select"),
+            ("② DEL creds", "delete_creds"),
+            ("③ DEL device", "delete_devices"),
+            ("④ Check",   "check_count"),
+            ("⑤ Redis",   "redis_flush"),
+        ]
+        for label, key in steps:
+            b = QPushButton(label)
+            b.setToolTip(f"Send the '{key}' command to the terminal")
+            b.clicked.connect(lambda _=False, k=key: self._send_step(k))
+            step_row.addWidget(b)
+            self._step_btns.append(b)
+
+        step_row.addStretch(1)
+        lay.addLayout(step_row)
+
+        # --- Free command input ---
+        free_row = QHBoxLayout()
+        self._free_cmd = QLineEdit()
+        self._free_cmd.setPlaceholderText("or type any command and press Send / Enter…")
+        self._free_cmd.returnPressed.connect(self._send_free_cmd)
+        btn_send = QPushButton("Send")
+        btn_send.clicked.connect(self._send_free_cmd)
+        free_row.addWidget(self._free_cmd)
+        free_row.addWidget(btn_send)
+        lay.addLayout(free_row)
+
+        # --- Terminal widget ---
+        self.terminal = TerminalPanel()
+        self.terminal.all_done.connect(self._on_done)
+        lay.addWidget(self.terminal)
 
         btn_row = QHBoxLayout()
-        btn_clear = QPushButton("Clear log")
-        btn_clear.clicked.connect(self.log_view.clear)
+        btn_clear = QPushButton("Clear")
+        btn_clear.clicked.connect(self.terminal.clear)
+        btn_start = QPushButton("Start PowerShell")
+        btn_start.clicked.connect(self.terminal.start)
         btn_row.addStretch(1)
         btn_row.addWidget(btn_clear)
+        btn_row.addWidget(btn_start)
         lay.addLayout(btn_row)
-
         return box
 
     # ------------------------------------------------------------------
@@ -427,12 +627,11 @@ class GvToolWindow(QMainWindow):
         if path:
             self.csv_edit.setText(path)
 
-    def _validate_inputs(self) -> str | None:
-        """Returns an error message if inputs are incomplete, else None."""
+    def _validate(self) -> str | None:
         if not self.csv_edit.text().strip():
             return "Please select a CSV file."
         if not Path(self.csv_edit.text().strip()).exists():
-            return f"CSV file not found:\n{self.csv_edit.text().strip()}"
+            return f"CSV not found:\n{self.csv_edit.text().strip()}"
         if not self.host_edit.text().strip():
             return "Host / IP is required."
         if not self.user_edit.text().strip():
@@ -442,11 +641,11 @@ class GvToolWindow(QMainWindow):
         if not self.redis_edit.text().strip():
             return "Redis container name is required."
         try:
-            port = int(self.port_edit.text().strip())
-            if not (1 <= port <= 65535):
+            p = int(self.port_edit.text().strip())
+            if not 1 <= p <= 65535:
                 raise ValueError
         except ValueError:
-            return "SSH Port must be a number between 1 and 65535."
+            return "SSH Port must be 1–65535."
         return None
 
     def _build_config(self) -> core.Config:
@@ -463,12 +662,12 @@ class GvToolWindow(QMainWindow):
             pg_user=self.pg_user_edit.text().strip(),
             redis_container=self.redis_edit.text().strip(),
             dry_run=self.dry_run_cb.isChecked(),
-            assume_yes=True,   # GUI always confirms via the warning label
+            assume_yes=True,
             no_redis=self.no_redis_cb.isChecked(),
         )
 
     def _on_run(self):
-        err = self._validate_inputs()
+        err = self._validate()
         if err:
             QMessageBox.warning(self, "Missing input", err)
             return
@@ -477,81 +676,114 @@ class GvToolWindow(QMainWindow):
             reply = QMessageBox.warning(
                 self,
                 "Live mode — are you sure?",
-                "LIVE mode will permanently delete devices from the database.\n\n"
-                "Type JA in the box below to confirm.",
+                "LIVE mode will permanently delete devices from the database.\n\nProceed?",
                 QMessageBox.Ok | QMessageBox.Cancel,
             )
             if reply != QMessageBox.Ok:
                 return
 
-        self.log_view.clear()
-        self._set_running(True)
-        self.status_label.setText("")
-
         cfg = self._build_config()
-        self._worker = GvWorker(cfg)
-        self._worker.signals.log_line.connect(self._on_log_line)
-        self._worker.signals.finished.connect(self._on_finished)
-        self._worker.start()
+
+        # Read CSV to get MACs (needed to build SQL commands)
+        try:
+            cfg.devices = core.read_csv(cfg.csv_path, _NullLog())
+        except (FileNotFoundError, ValueError) as e:
+            QMessageBox.critical(self, "CSV error", str(e))
+            return
+
+        core.validate_mode(cfg.devices, cfg.mode, _NullLog())
+        cmds = core.build_all_commands(cfg)
+
+        self._set_running(True)
+        self.status_lbl.setText("")
+        self.terminal.clear()
+
+        if cfg.dry_run:
+            self.terminal.show_dry_run(cmds)
+        else:
+            # Build ordered command list (without check_count as separate step —
+            # it runs as part of the same psql session via the last DELETE output)
+            cmd_list = [
+                cmds["select"],
+                cmds["delete_creds"],
+                cmds["delete_devices"],
+                cmds["check_count"],
+            ]
+            if not cfg.no_redis:
+                cmd_list.append(cmds["redis_flush"])
+
+            if self.terminal._proc.state() == QProcess.NotRunning:
+                self.terminal.start()
+                # Give PS a moment to start before sending SSH
+                QTimer.singleShot(800, lambda: self.terminal.run_ssh(cfg, cmd_list))
+            else:
+                self.terminal.run_ssh(cfg, cmd_list)
 
     def _on_cancel(self):
-        if self._worker and self._worker.isRunning():
-            self._worker.terminate()
-            self._append_log("WARN", "Cancelled by user.")
-            self._set_running(False)
-
-    def _on_log_line(self, level: str, message: str):
-        self._append_log(level, message)
-
-    def _on_finished(self, rc: int):
+        self.terminal.kill()
         self._set_running(False)
-        if rc == 0:
-            self.status_label.setStyleSheet(f"color: {OK_GREEN}; font-weight: bold;")
-            if self.dry_run_cb.isChecked():
-                self.status_label.setText("✓  Dry-run complete — review the log above.")
-            else:
-                self.status_label.setText("✓  Done. Devices removed + cache cleared. Re-import CSV via GV Web UI.")
-        elif rc == 1:
-            self.status_label.setStyleSheet(f"color: {WARN_ORANGE}; font-weight: bold;")
-            self.status_label.setText("Aborted.")
-        elif rc == 2:
-            self.status_label.setStyleSheet(f"color: {ERR_RED}; font-weight: bold;")
-            self.status_label.setText("✗  CSV error — see log.")
-        elif rc == 3:
-            self.status_label.setStyleSheet(f"color: {ERR_RED}; font-weight: bold;")
-            self.status_label.setText("✗  Server/DB error — see log.")
-        else:
-            self.status_label.setStyleSheet(f"color: {ERR_RED}; font-weight: bold;")
-            self.status_label.setText(f"✗  Unexpected error (rc={rc}) — see log.")
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    def _send_step(self, key: str):
+        """Send a single named step command to the terminal."""
+        err = self._validate()
+        if err:
+            QMessageBox.warning(self, "Missing input", err)
+            return
+        cfg = self._build_config()
+        try:
+            cfg.devices = core.read_csv(cfg.csv_path, _NullLog())
+        except (FileNotFoundError, ValueError) as e:
+            QMessageBox.critical(self, "CSV error", str(e))
+            return
+        cmds = core.build_all_commands(cfg)
+        cmd = cmds.get(key, "")
+        if cmd:
+            self.terminal._echo_cmd(cmd)
+            self.terminal._write(cmd)
+
+    def _send_free_cmd(self):
+        """Send whatever is typed in the free command input."""
+        text = self._free_cmd.text().strip()
+        if text:
+            self._free_cmd.clear()
+            self.terminal._echo_cmd(text)
+            self.terminal._write(text)
+
+    def _on_done(self, success: bool):
+        self._set_running(False)
+        if success:
+            self.status_lbl.setStyleSheet(f"color:{OK_GREEN}; font-weight:bold;")
+            if self.dry_run_cb.isChecked():
+                self.status_lbl.setText("✓  Dry-run complete.")
+            else:
+                self.status_lbl.setText(
+                    "✓  Done — devices removed + cache cleared. Re-import CSV via GV Web UI."
+                )
+        else:
+            self.status_lbl.setStyleSheet(f"color:{ERR_RED}; font-weight:bold;")
+            self.status_lbl.setText("✗  Error — see terminal output.")
 
     def _set_running(self, running: bool):
         self.run_btn.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
-        for widget in (
-            self.csv_edit, self.host_edit, self.port_edit, self.user_edit,
-            self.pw_edit, self.pg_container_edit, self.pg_db_edit,
-            self.pg_user_edit, self.redis_edit, self.mode_combo,
-            self.dry_run_cb, self.no_redis_cb,
+        for w in (
+            self.csv_edit, self.host_edit, self.port_edit,
+            self.user_edit, self.pw_edit, self.pg_container_edit,
+            self.pg_db_edit, self.pg_user_edit, self.redis_edit,
+            self.mode_combo, self.dry_run_cb, self.no_redis_cb,
         ):
-            widget.setEnabled(not running)
-
-    def _append_log(self, level: str, message: str):
-        color = LOG_COLORS.get(level, "#d4d4d4")
-        prefix = f"[{level:<5}]"
-        html = (
-            f'<span style="color:#7aabcc;">{prefix}</span> '
-            f'<span style="color:{color};">{_escape(message)}</span>'
-        )
-        self.log_view.appendHtml(html)
-        self.log_view.moveCursor(QTextCursor.End)
+            w.setEnabled(not running)
 
 
-def _escape(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+# ---------------------------------------------------------------------------
+# Null log (used when we only need side-effects, not log output)
+# ---------------------------------------------------------------------------
+class _NullLog:
+    def info(self, m): pass
+    def warn(self, m): pass
+    def error(self, m): pass
+    def ok(self, m): pass
+    def close(self): pass
 
 
 # ---------------------------------------------------------------------------
@@ -560,8 +792,10 @@ def _escape(text: str) -> str:
 def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(_stylesheet())
-    window = GvToolWindow()
-    window.show()
+    win = GvToolWindow()
+    win.show()
+    # Auto-start PowerShell so terminal is ready immediately
+    win.terminal.start()
     sys.exit(app.exec())
 
 
