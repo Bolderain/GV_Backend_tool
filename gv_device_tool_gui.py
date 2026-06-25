@@ -270,7 +270,8 @@ class GvToolWindow(QMainWindow):
         lay.addWidget(hint)
 
         row = QHBoxLayout()
-        self.csv_edit = QLineEdit()
+        _default_csv = str(Path(__file__).parent / "Device_import_20260603_Hassfurt_62_R310.csv")
+        self.csv_edit = QLineEdit(_default_csv if Path(_default_csv).exists() else "")
         self.csv_edit.setPlaceholderText("Path to CSV file…")
         row.addWidget(self.csv_edit)
         btn = QPushButton("Browse…")
@@ -303,8 +304,7 @@ class GvToolWindow(QMainWindow):
         grid.setVerticalSpacing(8)
 
         grid.addWidget(QLabel("Host / IP:"), 0, 0, Qt.AlignRight)
-        self.host_edit = QLineEdit()
-        self.host_edit.setPlaceholderText("e.g. 172.31.2.2")
+        self.host_edit = QLineEdit("172.31.2.2")
         grid.addWidget(self.host_edit, 0, 1)
 
         grid.addWidget(QLabel("Port:"), 0, 2, Qt.AlignRight)
@@ -313,8 +313,7 @@ class GvToolWindow(QMainWindow):
         grid.addWidget(self.port_edit, 0, 3)
 
         grid.addWidget(QLabel("SSH User:"), 1, 0, Qt.AlignRight)
-        self.user_edit = QLineEdit()
-        self.user_edit.setPlaceholderText("e.g. corinex")
+        self.user_edit = QLineEdit("corinex")
         grid.addWidget(self.user_edit, 1, 1)
 
         grid.addWidget(QLabel("SSH Password:"), 1, 2, Qt.AlignRight)
@@ -340,8 +339,7 @@ class GvToolWindow(QMainWindow):
         grid.addWidget(self.pg_container_edit, 0, 1)
 
         grid.addWidget(QLabel("Postgres DB:"), 0, 2, Qt.AlignRight)
-        self.pg_db_edit = QLineEdit()
-        self.pg_db_edit.setPlaceholderText("e.g. corinex")
+        self.pg_db_edit = QLineEdit("corinex")
         grid.addWidget(self.pg_db_edit, 0, 3)
 
         grid.addWidget(QLabel("Postgres user:"), 1, 0, Qt.AlignRight)
@@ -349,8 +347,7 @@ class GvToolWindow(QMainWindow):
         grid.addWidget(self.pg_user_edit, 1, 1)
 
         grid.addWidget(QLabel("Redis container:"), 1, 2, Qt.AlignRight)
-        self.redis_edit = QLineEdit()
-        self.redis_edit.setPlaceholderText("e.g. deployment-redis-1")
+        self.redis_edit = QLineEdit("deployment-redis-1")
         grid.addWidget(self.redis_edit, 1, 3)
 
         lay.addLayout(grid)
