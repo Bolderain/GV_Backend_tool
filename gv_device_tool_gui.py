@@ -52,10 +52,10 @@ WARN_ORANGE = "#b85c00"
 ERR_RED     = "#c42b1c"
 
 LOG_COLORS = {
-    "INFO":  "#1b1b1b",
-    "OK":    OK_GREEN,
-    "WARN":  WARN_ORANGE,
-    "ERROR": ERR_RED,
+    "INFO":  "#d4d4d4",
+    "OK":    "#4ec94e",
+    "WARN":  "#e8a44a",
+    "ERROR": "#f47474",
 }
 
 
@@ -546,10 +546,8 @@ class GvToolWindow(QMainWindow):
         color = LOG_COLORS.get(level, "#d4d4d4")
         prefix = f"[{level:<5}]"
         html = (
-            f'<span style="color:{color};">'
-            f'<span style="color:#5a7fa0;">{prefix}</span> '
-            f'{_escape(message)}'
-            f'</span>'
+            f'<span style="color:#7aabcc;">{prefix}</span> '
+            f'<span style="color:{color};">{_escape(message)}</span>'
         )
         self.log_view.appendHtml(html)
         self.log_view.moveCursor(QTextCursor.End)
