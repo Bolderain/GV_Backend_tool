@@ -22,6 +22,10 @@ from gv_device_tool import (
     build_redis_cmd,
     read_csv,
     validate_mode,
+    find_similar_containers,
+    list_containers,
+    verify_container,
+    step_verify_containers,
     step_delete,
     step_preview,
     step_redis,
@@ -49,13 +53,13 @@ def make_config(**overrides) -> Config:
     base = dict(
         csv_path="dummy.csv",
         mode="auto",
-        host=DEFAULTS["host"],
-        ssh_user=DEFAULTS["ssh_user"],
+        host="10.0.0.1",
+        ssh_user="testuser",
         ssh_port=DEFAULTS["ssh_port"],
         pg_container=DEFAULTS["pg_container"],
-        pg_db=DEFAULTS["pg_db"],
+        pg_db="testdb",
         pg_user=DEFAULTS["pg_user"],
-        redis_container=DEFAULTS["redis_container"],
+        redis_container="deployment-redis-1",
         dry_run=False,
         assume_yes=True,
         no_redis=False,
@@ -212,7 +216,7 @@ class TestCommandBuilder:
     def test_redis_flush_cmd(self):
         cmds = build_all_commands(self.cfg)
         assert "FLUSHALL" in cmds["redis_flush"]
-        assert DEFAULTS["redis_container"] in cmds["redis_flush"]
+        assert self.cfg.redis_container in cmds["redis_flush"]
 
     def test_pg_cmd_contains_container(self):
         cmd = build_pg_cmd("my-container", "mydb", "myuser", "SELECT 1;")
@@ -395,6 +399,8 @@ class TestRun:
         cfg.devices = []
         ssh_mock = MagicMock()
         ssh_mock.run.side_effect = [
+            (0, "true", ""),                     # verify postgres container
+            (0, "true", ""),                     # verify redis container
             (0, "00:0B:C2:17:06:CB|R330", ""),  # preview SELECT
             (0, "DELETE 2", ""),                  # delete_creds
             (0, "DELETE 2", ""),                  # delete_devices
@@ -413,7 +419,7 @@ class TestRun:
         assert rc == 1
 
     def test_missing_csv_returns_2(self, tmp_path):
-        cfg = make_config(csv_path=str(tmp_path / "nonexistent.csv"))
+        cfg = make_config(csv_path=str(tmp_path / "nonexistent.csv"), dry_run=True)
         cfg.devices = []
         rc = run(cfg, null_log())
         assert rc == 2
@@ -422,7 +428,11 @@ class TestRun:
         cfg = make_config(csv_path=self._make_csv(tmp_path), dry_run=False, assume_yes=True)
         cfg.devices = []
         ssh_mock = MagicMock()
-        ssh_mock.run.side_effect = [(1, "", "connection refused")]
+        # container verify: inspect fails, docker ps also fails -> RuntimeError -> exit 3
+        ssh_mock.run.side_effect = [
+            (1, "", "No such container"),  # docker inspect
+            (0, "", ""),                   # docker ps returns empty (no containers)
+        ]
         with patch("gv_device_tool.SSHClient", return_value=ssh_mock):
             rc = run(cfg, null_log())
         assert rc == 3
@@ -437,7 +447,8 @@ class TestRun:
         cfg.devices = []
         ssh_mock = MagicMock()
         ssh_mock.run.side_effect = [
-            (0, "", ""),      # preview
+            (0, "true", ""),    # verify postgres (redis skipped via no_redis)
+            (0, "", ""),        # preview SELECT
             (0, "DELETE 2", ""),
             (0, "DELETE 2", ""),
             (0, "0", ""),
@@ -445,42 +456,154 @@ class TestRun:
         with patch("gv_device_tool.SSHClient", return_value=ssh_mock):
             rc = run(cfg, null_log())
         assert rc == 0
-        # redis_flush must NOT have been called (only 4 calls total)
-        assert ssh_mock.run.call_count == 4
+        # 1 verify + 1 preview + 3 delete/check = 5, no redis flush
+        assert ssh_mock.run.call_count == 5
+
+
+# ---------------------------------------------------------------------------
+# Container discovery
+# ---------------------------------------------------------------------------
+
+class TestContainerDiscovery:
+    RUNNING = ["deployment-postgres-1", "deployment-redis-1", "nginx", "some-app"]
+
+    def test_exact_match_found(self):
+        result = find_similar_containers("deployment-postgres-1", self.RUNNING)
+        assert "deployment-postgres-1" in result
+
+    def test_partial_name_match(self):
+        result = find_similar_containers("postgres", self.RUNNING)
+        assert any("postgres" in r for r in result)
+
+    def test_typo_fuzzy_match(self):
+        result = find_similar_containers("deployment-posgress-1", self.RUNNING)
+        assert any("postgres" in r for r in result)
+
+    def test_no_match_returns_empty(self):
+        result = find_similar_containers("completely-unrelated-xyz", self.RUNNING)
+        assert result == []
+
+    def test_list_containers_parses_output(self):
+        ssh = MagicMock()
+        ssh.run.return_value = (0, "deployment-postgres-1\ndeployment-redis-1\n", "")
+        result = list_containers(ssh)
+        assert result == ["deployment-postgres-1", "deployment-redis-1"]
+
+    def test_list_containers_returns_empty_on_failure(self):
+        ssh = MagicMock()
+        ssh.run.return_value = (1, "", "permission denied")
+        assert list_containers(ssh) == []
+
+    def test_verify_container_ok(self):
+        ssh = MagicMock()
+        ssh.run.return_value = (0, "true", "")
+        verify_container(ssh, "deployment-postgres-1", "pg-container", null_log())  # no exception
+
+    def test_verify_container_not_found_raises_with_suggestion(self):
+        ssh = MagicMock()
+        ssh.run.side_effect = [
+            (1, "", "No such container"),                              # inspect fails
+            (0, "deployment-postgres-1\ndeployment-redis-1", ""),     # docker ps
+        ]
+        log = null_log()
+        with pytest.raises(RuntimeError, match="pg-container"):
+            verify_container(ssh, "deployment-posgress-1", "pg-container", log)
+
+    def test_verify_container_no_running_containers(self):
+        ssh = MagicMock()
+        ssh.run.side_effect = [
+            (1, "", "No such container"),
+            (1, "", "permission denied"),  # docker ps also fails
+        ]
+        with pytest.raises(RuntimeError):
+            verify_container(ssh, "missing", "pg-container", null_log())
+
+    def test_step_verify_containers_calls_both(self):
+        cfg = make_config()
+        ssh = MagicMock()
+        ssh.run.return_value = (0, "true", "")
+        step_verify_containers(ssh, cfg, null_log())
+        assert ssh.run.call_count == 2  # postgres + redis
+
+    def test_step_verify_containers_skips_redis_when_no_redis(self):
+        cfg = make_config(no_redis=True)
+        ssh = MagicMock()
+        ssh.run.return_value = (0, "true", "")
+        step_verify_containers(ssh, cfg, null_log())
+        assert ssh.run.call_count == 1  # postgres only
 
 
 # ---------------------------------------------------------------------------
 # CLI argument parser
 # ---------------------------------------------------------------------------
 
-class TestCLI:
-    def test_default_host(self):
-        from gv_device_tool import build_parser
-        args = build_parser().parse_args(["--csv", "x.csv"])
-        assert args.host == DEFAULTS["host"]
+REQUIRED_ARGS = [
+    "--host", "10.0.0.1",
+    "--ssh-user", "testuser",
+    "--pg-db", "testdb",
+    "--redis-container", "deployment-redis-1",
+]
 
-    def test_custom_host(self):
+
+class TestCLI:
+    def test_required_args_accepted(self):
         from gv_device_tool import build_parser
-        args = build_parser().parse_args(["--csv", "x.csv", "--host", "10.0.0.1"])
+        args = build_parser().parse_args(["--csv", "x.csv"] + REQUIRED_ARGS)
         assert args.host == "10.0.0.1"
+        assert args.ssh_user == "testuser"
+
+    def test_missing_host_raises(self):
+        from gv_device_tool import build_parser
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--csv", "x.csv", "--ssh-user", "u",
+                                       "--pg-db", "db", "--redis-container", "r"])
+
+    def test_missing_ssh_user_raises(self):
+        from gv_device_tool import build_parser
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--csv", "x.csv", "--host", "h",
+                                       "--pg-db", "db", "--redis-container", "r"])
+
+    def test_missing_pg_db_raises(self):
+        from gv_device_tool import build_parser
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--csv", "x.csv", "--host", "h",
+                                       "--ssh-user", "u", "--redis-container", "r"])
+
+    def test_missing_redis_container_raises(self):
+        from gv_device_tool import build_parser
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--csv", "x.csv", "--host", "h",
+                                       "--ssh-user", "u", "--pg-db", "db"])
+
+    def test_default_pg_container(self):
+        from gv_device_tool import build_parser
+        args = build_parser().parse_args(["--csv", "x.csv"] + REQUIRED_ARGS)
+        assert args.pg_container == DEFAULTS["pg_container"]
+
+    def test_custom_pg_container(self):
+        from gv_device_tool import build_parser
+        args = build_parser().parse_args(["--csv", "x.csv"] + REQUIRED_ARGS
+                                         + ["--pg-container", "my-postgres"])
+        assert args.pg_container == "my-postgres"
 
     def test_dry_run_flag(self):
         from gv_device_tool import build_parser
-        args = build_parser().parse_args(["--csv", "x.csv", "--dry-run"])
+        args = build_parser().parse_args(["--csv", "x.csv"] + REQUIRED_ARGS + ["--dry-run"])
         assert args.dry_run is True
 
     def test_yes_flag(self):
         from gv_device_tool import build_parser
-        args = build_parser().parse_args(["--csv", "x.csv", "-y"])
+        args = build_parser().parse_args(["--csv", "x.csv"] + REQUIRED_ARGS + ["-y"])
         assert args.yes is True
 
     def test_mode_choices(self):
         from gv_device_tool import build_parser
         for mode in ["repeater", "headend", "proxy", "1t", "auto"]:
-            args = build_parser().parse_args(["--csv", "x.csv", "--mode", mode])
+            args = build_parser().parse_args(["--csv", "x.csv"] + REQUIRED_ARGS + ["--mode", mode])
             assert args.mode == mode
 
     def test_invalid_mode_raises(self):
         from gv_device_tool import build_parser
         with pytest.raises(SystemExit):
-            build_parser().parse_args(["--csv", "x.csv", "--mode", "invalid"])
+            build_parser().parse_args(["--csv", "x.csv"] + REQUIRED_ARGS + ["--mode", "invalid"])

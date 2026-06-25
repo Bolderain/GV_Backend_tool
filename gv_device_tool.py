@@ -33,17 +33,13 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
-# Defaults (aus info.txt / Jakub-Anleitung)
+# Defaults — only generic / non-sensitive values hardcoded
 # ---------------------------------------------------------------------------
 
 DEFAULTS = {
-    "host": "172.31.2.2",
-    "ssh_user": "corinex",
     "ssh_port": 22,
     "pg_container": "deployment-postgres-1",
-    "pg_db": "corinex",
     "pg_user": "postgres",
-    "redis_container": "deployment-redis-1",
 }
 
 # Erwartete Type-Praefixe je Modus (nur Warnung, kein Abbruch)
@@ -254,8 +250,68 @@ class SSHClient:
 
 
 # ---------------------------------------------------------------------------
+# Container discovery
+# ---------------------------------------------------------------------------
+
+def list_containers(ssh: SSHClient) -> List[str]:
+    """Returns names of all running Docker containers on the remote host."""
+    rc, out, err = ssh.run("docker ps --format '{{.Names}}'")
+    if rc != 0:
+        return []
+    return [l.strip() for l in out.splitlines() if l.strip()]
+
+
+def find_similar_containers(name: str, containers: List[str]) -> List[str]:
+    """Returns containers whose name contains any part of the target name (case-insensitive)."""
+    import difflib
+    # exact substring matches first
+    parts = [p for p in name.replace("-", " ").replace("_", " ").split() if len(p) > 2]
+    substring_hits = [c for c in containers if any(p.lower() in c.lower() for p in parts)]
+    if substring_hits:
+        return substring_hits
+    # fall back to difflib close matches
+    return difflib.get_close_matches(name, containers, n=5, cutoff=0.4)
+
+
+def verify_container(ssh: SSHClient, name: str, label: str, log: Log) -> None:
+    """
+    Checks that a container is running. If not found, lists similar containers
+    and raises so the user can correct the name via CLI flag.
+    """
+    rc, out, _ = ssh.run(f"docker inspect --format '{{{{.State.Running}}}}' {name}")
+    if rc == 0 and out.strip() == "true":
+        return  # all good
+
+    log.warn(f"Container '{name}' ({label}) nicht gefunden oder nicht aktiv.")
+    containers = list_containers(ssh)
+    if not containers:
+        log.warn("    Keine laufenden Docker-Container gefunden (docker ps fehlgeschlagen).")
+        raise RuntimeError(f"Container '{name}' nicht erreichbar.")
+
+    similar = find_similar_containers(name, containers)
+    if similar:
+        log.warn("    Aehnliche Container gefunden — meintest du einen davon?")
+        for c in similar:
+            log.warn(f"      {c}")
+        log.warn(f"    Benutze z.B.: --{label.replace('_', '-')} {similar[0]}")
+    else:
+        log.warn(f"    Laufende Container: {', '.join(containers)}")
+    raise RuntimeError(f"Container '{name}' nicht gefunden. Bitte --{label.replace('_', '-')} anpassen.")
+
+
+# ---------------------------------------------------------------------------
 # Ausfuehrungs-Schritte
 # ---------------------------------------------------------------------------
+
+def step_verify_containers(ssh: SSHClient, cfg: Config, log: Log) -> None:
+    """Verifies both containers exist before touching the DB. Suggests alternatives if not."""
+    log.info("Schritt 0/4 — Container-Pruefung:")
+    verify_container(ssh, cfg.pg_container,    "pg-container",    log)
+    log.ok(f"    Postgres: {cfg.pg_container} OK")
+    if not cfg.no_redis:
+        verify_container(ssh, cfg.redis_container, "redis-container", log)
+        log.ok(f"    Redis:    {cfg.redis_container} OK")
+
 
 def step_preview(ssh: SSHClient, cmds: dict, cfg: Config, log: Log) -> None:
     log.info(f"Schritt 1/4 — Bestandsaufnahme ({len(cfg.devices)} Geraete in CSV):")
@@ -350,7 +406,12 @@ def print_dry_run(cmds: dict, cfg: Config, log: Log) -> None:
 # ---------------------------------------------------------------------------
 
 def run(cfg: Config, log: Log) -> int:
-    cfg.devices = read_csv(cfg.csv_path, log)
+    try:
+        cfg.devices = read_csv(cfg.csv_path, log)
+    except (FileNotFoundError, ValueError) as e:
+        log.error(str(e))
+        return 2
+
     validate_mode(cfg.devices, cfg.mode, log)
     print_summary(cfg)
 
@@ -364,13 +425,21 @@ def run(cfg: Config, log: Log) -> int:
         print_dry_run(cmds, cfg, log)
         return 0
 
-    ssh = SSHClient(cfg, log)
     try:
-        step_preview(ssh, cmds, cfg, log)
-        step_delete(ssh, cmds, log)
-        step_redis(ssh, cmds, cfg, log)
-    finally:
-        ssh.close()
+        ssh = SSHClient(cfg, log)
+        try:
+            step_verify_containers(ssh, cfg, log)
+            step_preview(ssh, cmds, cfg, log)
+            step_delete(ssh, cmds, log)
+            step_redis(ssh, cmds, cfg, log)
+        finally:
+            ssh.close()
+    except RuntimeError as e:
+        log.error(str(e))
+        return 3
+    except Exception as e:
+        log.error(f"Unerwarteter Fehler: {e}")
+        return 4
 
     step_import_hint(cfg, log)
     log.ok("Fertig. Geraete entfernt + Cache geleert. Bitte CSV in GV re-importieren.")
@@ -386,23 +455,27 @@ def build_parser() -> argparse.ArgumentParser:
         description="GV Device-Korrektur-Tool (repeater / headend / proxy / 1t).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--csv",           required=True,            help="Pfad zur korrigierten GV-Import-CSV.")
-    p.add_argument("--mode",          default="auto",           choices=list(MODE_TYPE_PREFIXES.keys()),
-                                                                help="Geraete-Kategorie (validiert Type-Spalte).")
-    p.add_argument("--host",          default=DEFAULTS["host"])
-    p.add_argument("--ssh-user",      default=DEFAULTS["ssh_user"])
-    p.add_argument("--ssh-port",      default=DEFAULTS["ssh_port"], type=int)
-    p.add_argument("--ssh-key",       default=None,             help="Pfad zum privaten SSH-Key.")
-    p.add_argument("--ssh-password",  default=None,             help="SSH-Passwort (Klartext; lieber --ask-password).")
-    p.add_argument("--ask-password",  action="store_true",      help="SSH-Passwort interaktiv abfragen.")
-    p.add_argument("--pg-container",  default=DEFAULTS["pg_container"])
-    p.add_argument("--pg-db",         default=DEFAULTS["pg_db"])
-    p.add_argument("--pg-user",       default=DEFAULTS["pg_user"])
-    p.add_argument("--redis-container", default=DEFAULTS["redis_container"])
-    p.add_argument("--no-redis",      action="store_true",      help="Redis FLUSHALL ueberspringen.")
-    p.add_argument("--dry-run",       action="store_true",      help="Nichts aendern, nur Befehle anzeigen.")
-    p.add_argument("-y", "--yes",     action="store_true",      help="Ohne Rueckfrage ausfuehren.")
-    p.add_argument("--log",           default=None,             help="Pfad zur Logdatei.")
+    p.add_argument("--csv",             required=True,                        help="Path to the corrected GV import CSV.")
+    p.add_argument("--mode",            default="auto",                       choices=list(MODE_TYPE_PREFIXES.keys()),
+                                                                              help="Device category (validates type column).")
+    # Connection — required, no hardcoded defaults
+    p.add_argument("--host",            required=True,                        help="GV server hostname or IP.")
+    p.add_argument("--ssh-user",        required=True,                        help="SSH username.")
+    p.add_argument("--ssh-port",        default=DEFAULTS["ssh_port"],         type=int, help="SSH port.")
+    p.add_argument("--ssh-key",         default=None,                         help="Path to private SSH key.")
+    p.add_argument("--ssh-password",    default=None,                         help="SSH password (prefer --ask-password).")
+    p.add_argument("--ask-password",    action="store_true",                  help="Prompt for SSH password interactively.")
+    # Postgres
+    p.add_argument("--pg-container",    default=DEFAULTS["pg_container"],     help="Postgres Docker container name.")
+    p.add_argument("--pg-db",           required=True,                        help="Postgres database name.")
+    p.add_argument("--pg-user",         default=DEFAULTS["pg_user"],          help="Postgres user.")
+    # Redis
+    p.add_argument("--redis-container", required=True,                        help="Redis Docker container name.")
+    p.add_argument("--no-redis",        action="store_true",                  help="Skip Redis FLUSHALL.")
+    # Behaviour
+    p.add_argument("--dry-run",         action="store_true",                  help="Print commands only, change nothing.")
+    p.add_argument("-y", "--yes",       action="store_true",                  help="Skip confirmation prompt.")
+    p.add_argument("--log",             default=None,                         help="Path to log file.")
     return p
 
 
