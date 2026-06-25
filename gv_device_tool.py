@@ -394,10 +394,10 @@ def print_dry_run(cmds: dict, cfg: Config, log: Log) -> None:
     log.info("DRY-RUN — diese Befehle wuerden auf dem Server laufen:")
     for key, cmd in cmds.items():
         if key == "redis_flush" and cfg.no_redis:
-            print(f"\n# (uebersprungen: --no-redis)\n# {cmd}")
+            log.info(f"# (uebersprungen: --no-redis)")
+            log.info(f"# {cmd}")
         else:
-            print(f"\n{cmd}")
-    print()
+            log.info(cmd)
     log.info("Danach: CSV per GV-Web-UI re-importieren.")
 
 
