@@ -572,33 +572,59 @@ class GvToolWindow(QMainWindow):
 
         self._step_btns: list[QPushButton] = []
 
+        STEP_TOOLTIPS = {
+            "select": (
+                "① SELECT — Preview\n\n"
+                "Shows which devices from the CSV are currently in GV's Postgres database.\n"
+                "Read-only — no changes made.\n\n"
+                "Run this first to confirm the devices exist before deleting."
+            ),
+            "delete_creds": (
+                "② DELETE device_credentials\n\n"
+                "Removes the credential records for all MACs in the CSV.\n"
+                "Must run BEFORE deleting the device itself due to a\n"
+                "foreign-key constraint (device_credentials → device).\n\n"
+                "Skipping this step causes the next DELETE to fail."
+            ),
+            "delete_devices": (
+                "③ DELETE device\n\n"
+                "Removes the device records from Postgres.\n"
+                "After this the devices are gone from the database.\n\n"
+                "Run step ② first, otherwise the foreign-key constraint blocks this."
+            ),
+            "check_count": (
+                "④ COUNT check\n\n"
+                "Verifies that all devices were actually deleted.\n"
+                "Expected result: 0\n\n"
+                "If the count is not 0, something went wrong — do NOT flush Redis yet."
+            ),
+            "redis_flush": (
+                "⑤ Redis FLUSHALL\n\n"
+                "GV caches device data in Redis. Even after deleting from Postgres,\n"
+                "GV would still serve stale device data from the cache.\n\n"
+                "FLUSHALL clears the ENTIRE Redis cache (not just the affected devices).\n"
+                "GV reloads all data fresh from Postgres on next access.\n\n"
+                "⚠  Brief performance impact until caches warm up again.\n"
+                "⚠  Only run AFTER step ④ confirms count = 0."
+            ),
+        }
+
         steps = [
-            ("① SELECT",  "select"),
-            ("② DEL creds", "delete_creds"),
-            ("③ DEL device", "delete_devices"),
-            ("④ Check",   "check_count"),
-            ("⑤ Redis",   "redis_flush"),
+            ("① SELECT",      "select"),
+            ("② DEL creds",   "delete_creds"),
+            ("③ DEL device",  "delete_devices"),
+            ("④ Check count", "check_count"),
+            ("⑤ Redis FLUSH", "redis_flush"),
         ]
         for label, key in steps:
             b = QPushButton(label)
-            b.setToolTip(f"Send the '{key}' command to the terminal")
+            b.setToolTip(STEP_TOOLTIPS[key])
             b.clicked.connect(lambda _=False, k=key: self._send_step(k))
             step_row.addWidget(b)
             self._step_btns.append(b)
 
         step_row.addStretch(1)
         lay.addLayout(step_row)
-
-        # --- Free command input ---
-        free_row = QHBoxLayout()
-        self._free_cmd = QLineEdit()
-        self._free_cmd.setPlaceholderText("or type any command and press Send / Enter…")
-        self._free_cmd.returnPressed.connect(self._send_free_cmd)
-        btn_send = QPushButton("Send")
-        btn_send.clicked.connect(self._send_free_cmd)
-        free_row.addWidget(self._free_cmd)
-        free_row.addWidget(btn_send)
-        lay.addLayout(free_row)
 
         # --- Terminal widget ---
         self.terminal = TerminalPanel()
@@ -741,13 +767,6 @@ class GvToolWindow(QMainWindow):
             self.terminal._echo_cmd(cmd)
             self.terminal._write(cmd)
 
-    def _send_free_cmd(self):
-        """Send whatever is typed in the free command input."""
-        text = self._free_cmd.text().strip()
-        if text:
-            self._free_cmd.clear()
-            self.terminal._echo_cmd(text)
-            self.terminal._write(text)
 
     def _on_done(self, success: bool):
         self._set_running(False)
